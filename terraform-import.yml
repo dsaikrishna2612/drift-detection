@@ -1,0 +1,279 @@
+name: Terraform Import (Module Aware)
+
+on:
+  workflow_dispatch:
+
+    inputs:
+
+      module_name:
+        description: "Module name (example: ec2)"
+        required: true
+
+      resource_type:
+        description: "Resource type (example: aws_instance)"
+        required: true
+
+      resource_name:
+        description: "Resource name (example: example)"
+        required: true
+
+      resource_id:
+        description: "Resource ID (example: i-123abc)"
+        required: true
+
+
+jobs:
+  terraform-import:
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    defaults:
+      run:
+        working-directory: ./terraform
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+
+
+#################################################
+# CHECKOUT
+#################################################
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+
+#################################################
+# SETUP TERRAFORM
+#################################################
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.3
+          terraform_wrapper: false
+
+
+#################################################
+# AWS AUTH
+#################################################
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+
+#################################################
+# INIT
+#################################################
+
+      - name: Terraform Init
+        run: terraform init
+
+
+#################################################
+# DEFINE MODULE PATH
+#################################################
+
+      - name: Set Module Path
+        id: modulepath
+        run: |
+
+          MODULE_PATH="./modules/${{ github.event.inputs.module_name }}"
+
+          echo "module_path=$MODULE_PATH" >> "$GITHUB_OUTPUT"
+
+          if [ ! -d "$MODULE_PATH" ]; then
+            echo "Module folder not found"
+            exit 1
+          fi
+
+
+#################################################
+# CHECK IF RESOURCE ALREADY EXISTS
+#################################################
+
+      - name: Check State Exists
+        id: check_state
+        run: |
+
+          RESOURCE="module.${{ github.event.inputs.module_name }}.${{ github.event.inputs.resource_type }}.${{ github.event.inputs.resource_name }}"
+
+          if terraform state list | grep -q "$RESOURCE"
+          then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+
+#################################################
+# CREATE PLACEHOLDER RESOURCE IN MODULE
+#################################################
+
+      - name: Create Placeholder Resource Block
+        if: steps.check_state.outputs.exists == 'false'
+        run: |
+
+          FILE="${{ steps.modulepath.outputs.module_path }}/main.tf"
+
+          echo "
+resource \"${{ github.event.inputs.resource_type }}\" \"${{ github.event.inputs.resource_name }}\" {}
+" >> "$FILE"
+
+          echo "Placeholder added to module file"
+
+
+#################################################
+# IMPORT RESOURCE INTO MODULE
+#################################################
+
+      - name: Terraform Import Resource
+        if: steps.check_state.outputs.exists == 'false'
+        run: |
+
+          terraform import \
+          module.${{ github.event.inputs.module_name }}.${{ github.event.inputs.resource_type }}.${{ github.event.inputs.resource_name }} \
+          ${{ github.event.inputs.resource_id }}
+
+
+#################################################
+# GENERATE CLEAN CONFIG FROM STATE
+#################################################
+
+      - name: Generate Clean Resource Config
+        if: steps.check_state.outputs.exists == 'false'
+        run: |
+
+          terraform state show -no-color \
+          module.${{ github.event.inputs.module_name }}.${{ github.event.inputs.resource_type }}.${{ github.event.inputs.resource_name }} \
+          > raw_state.txt
+
+
+#################################################
+# CLEAN COMPUTED FIELDS
+#################################################
+
+      - name: Clean Config Fields
+        if: steps.check_state.outputs.exists == 'false'
+        run: |
+
+          MODULE_FILE="${{ steps.modulepath.outputs.module_path }}/main.tf"
+
+          grep -vE '^( *arn *=| *id *=| *owner_id *=| *tags_all *=)' \
+          raw_state.txt > cleaned_block.txt
+
+          sed -i "/resource \"${{ github.event.inputs.resource_type }}\" \"${{ github.event.inputs.resource_name }}\" {/,/}/d" "$MODULE_FILE"
+
+          echo "resource \"${{ github.event.inputs.resource_type }}\" \"${{ github.event.inputs.resource_name }}\" {" >> "$MODULE_FILE"
+
+          cat cleaned_block.txt >> "$MODULE_FILE"
+
+          echo "}" >> "$MODULE_FILE"
+
+
+#################################################
+# VALIDATE CONFIG
+#################################################
+
+      - name: Terraform Validate
+        run: terraform validate
+
+
+#################################################
+# CAPTURE STATE LIST
+#################################################
+
+      - name: Capture State List
+        run: terraform state list > state_list.txt
+
+
+#################################################
+# COMMIT CHANGES
+#################################################
+
+      - name: Commit Changes
+        if: steps.check_state.outputs.exists == 'false'
+        run: |
+
+          git config --global user.name github-actions
+          git config --global user.email actions@github.com
+
+          git add .
+
+          git diff --cached --quiet || \
+          git commit -m "Imported resource into module: ${{ github.event.inputs.module_name }}"
+
+
+#################################################
+# CREATE PR
+#################################################
+
+      - name: Create Pull Request
+        id: pr
+        if: steps.check_state.outputs.exists == 'false'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: terraform-module-import-${{ github.run_id }}
+          title: Terraform Module Import Sync
+          commit-message: Terraform module import sync
+          base: main
+
+
+#################################################
+# TEAMS SUCCESS MESSAGE
+#################################################
+
+      - name: Notify Teams Success
+        if: steps.check_state.outputs.exists == 'false'
+        run: |
+
+          STATE_OUTPUT=$(cat state_list.txt)
+
+          curl -H "Content-Type: application/json" \
+          -d "{
+          \"@type\":\"MessageCard\",
+          \"summary\":\"Terraform Module Import Success\",
+          \"themeColor\":\"00FF00\",
+          \"title\":\"✅ Module Resource Imported Successfully\",
+          \"sections\":[
+          {
+          \"activityTitle\":\"Resource Imported\",
+          \"text\":\"module.${{ github.event.inputs.module_name }}.${{ github.event.inputs.resource_type }}.${{ github.event.inputs.resource_name }}\"
+          },
+          {
+          \"activityTitle\":\"Pull Request\",
+          \"text\":\"${{ steps.pr.outputs.pull-request-url }}\"
+          }
+          ]
+          }" \
+          ${{ secrets.TEAMS_WEBHOOK_URL }}
+
+
+#################################################
+# SKIP MESSAGE
+#################################################
+
+      - name: Notify Teams Skipped
+        if: steps.check_state.outputs.exists == 'true'
+        run: |
+
+          curl -H "Content-Type: application/json" \
+          -d '{
+          "@type":"MessageCard",
+          "summary":"Terraform Import Skipped",
+          "themeColor":"FFA500",
+          "title":"⚠️ Resource Already Managed",
+          "text":"Import skipped because resource already exists in statefile."
+          }' \
+          ${{ secrets.TEAMS_WEBHOOK_URL }}
