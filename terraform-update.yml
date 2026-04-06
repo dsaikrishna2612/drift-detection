@@ -1,0 +1,275 @@
+name: Terraform Drift Update (Module Aware)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  drift-update:
+    name: Detect and Fix Drift (Module Safe)
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    defaults:
+      run:
+        working-directory: ./terraform
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      TF_VAR_ami: ${{ secrets.TF_VAR_AMI }}
+      TF_VAR_region: ${{ secrets.TF_VAR_REGION }}
+      TF_VAR_instance_type: ${{ secrets.TF_VAR_INSTANCE_TYPE }}
+      TF_VAR_key_name: ${{ secrets.TF_VAR_KEY_NAME }}
+      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+
+#################################################
+# CHECKOUT
+#################################################
+
+    steps:
+
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+
+#################################################
+# TERRAFORM SETUP
+#################################################
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.10.3
+        terraform_wrapper: false
+
+
+#################################################
+# AWS AUTH
+#################################################
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+
+#################################################
+# SSH KEYS
+#################################################
+
+    - name: Inject SSH Public Key
+      run: echo "TF_VAR_ssh_public_key=${{ secrets.SSH_PUBLIC_KEY }}" >> $GITHUB_ENV
+
+
+    - name: Inject SSH Private Key
+      run: |
+        echo "TF_VAR_ssh_private_key<<EOF" >> $GITHUB_ENV
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" >> $GITHUB_ENV
+        echo "EOF" >> $GITHUB_ENV
+
+
+#################################################
+# TERRAFORM INIT
+#################################################
+
+    - name: Terraform Init
+      run: terraform init
+
+
+#################################################
+# TERRAFORM PLAN
+#################################################
+
+    - name: Terraform Plan
+      id: plan
+      run: |
+        set +e
+        terraform plan -detailed-exitcode -out=tfplan.binary -no-color > plan_output.txt 2>&1
+        EXIT_CODE=$?
+        echo "exitcode=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+        exit 0
+
+
+#################################################
+# EXPORT PLAN JSON
+#################################################
+
+    - name: Convert Plan to JSON
+      if: steps.plan.outputs.exitcode == '2'
+      run: terraform show -json tfplan.binary > tfplan.json
+
+
+#################################################
+# IDENTIFY DRIFTED RESOURCES
+#################################################
+
+    - name: Detect Drifted Resources
+      if: steps.plan.outputs.exitcode == '2'
+      run: |
+        jq -r '.resource_changes[]
+        | select(.change.actions | index("update"))
+        | .address' tfplan.json > drifted_resources.txt
+
+
+#################################################
+# PATCH MODULE FILES SAFELY
+#################################################
+
+    - name: Patch Module Files
+      if: steps.plan.outputs.exitcode == '2'
+      run: |
+
+        if [ ! -s drifted_resources.txt ]; then
+          echo "No drift detected"
+          exit 0
+        fi
+
+        while read resource
+        do
+
+          echo "Processing resource: $resource"
+
+          IFS='.' read -r PREFIX MODULE TYPE NAME <<< "$resource"
+
+          if [ "$PREFIX" == "module" ]; then
+            MODULE_PATH="./modules/$MODULE"
+          else
+            MODULE_PATH="."
+          fi
+
+          FILE=$(grep -rl \
+          "resource \"$TYPE\" \"$NAME\"" \
+          "$MODULE_PATH")
+
+          if [ -z "$FILE" ]; then
+            echo "Resource file not found for $resource"
+            continue
+          fi
+
+          echo "Located file: $FILE"
+
+
+#################################################
+# EXTRACT UPDATED ATTRIBUTES
+#################################################
+
+          jq -r \
+          --arg res "$resource" '
+          .resource_changes[]
+          | select(.address==$res)
+          | .change.after
+          | to_entries[]
+          | select(.value!=null)
+          | "\(.key) = \(.value|tostring)"
+          ' tfplan.json > patch_block.txt
+
+
+#################################################
+# INSERT PATCH INTO RESOURCE BLOCK
+#################################################
+
+          if [ -s patch_block.txt ]; then
+
+            sed -i \
+            "/resource \"$TYPE\" \"$NAME\" {/r patch_block.txt" \
+            "$FILE"
+
+            echo "Updated module resource block"
+
+          else
+            echo "Nothing to patch"
+          fi
+
+
+#################################################
+# PATCH ROOT MODULE CALL IF VARIABLE USED
+#################################################
+
+          ROOT_MODULE_FILE=$(grep -rl "module \"$MODULE\"" . || true)
+
+          if [ -n "$ROOT_MODULE_FILE" ]; then
+
+            while read attr
+            do
+
+              KEY=$(echo $attr | cut -d'=' -f1 | xargs)
+              VALUE=$(echo $attr | cut -d'=' -f2- | xargs)
+
+              sed -i \
+              "s/$KEY *= *.*/$KEY = \"$VALUE\"/g" \
+              "$ROOT_MODULE_FILE"
+
+            done < patch_block.txt
+
+            echo "Updated root module call"
+
+          fi
+
+        done < drifted_resources.txt
+
+
+#################################################
+# COMMIT CHANGES
+#################################################
+
+    - name: Commit Changes
+      if: steps.plan.outputs.exitcode == '2'
+      run: |
+
+        git config --global user.name github-actions
+        git config --global user.email actions@github.com
+
+        git add .
+
+        git diff --cached --quiet || \
+        git commit -m "Auto-remediation: Sync Terraform modules with drift"
+
+
+#################################################
+# CREATE PR
+#################################################
+
+    - name: Create Pull Request
+      id: pr
+      if: steps.plan.outputs.exitcode == '2'
+      uses: peter-evans/create-pull-request@v6
+      with:
+        commit-message: Sync Terraform modules with drift
+        title: Terraform Drift Auto Remediation
+        branch: terraform-module-drift-fix
+        base: main
+        delete-branch: true
+
+
+#################################################
+# TEAMS NOTIFICATION
+#################################################
+
+    - name: Notify Teams Success
+      if: steps.plan.outputs.exitcode == '2'
+      run: |
+
+        UPDATED=$(cat drifted_resources.txt | sed ':a;N;$!ba;s/\n/, /g')
+
+        curl -H "Content-Type: application/json" \
+        -d "{
+        \"@type\":\"MessageCard\",
+        \"summary\":\"Terraform Drift Auto Fix Success\",
+        \"themeColor\":\"00FF00\",
+        \"title\":\"✅ Module Drift Fixed Automatically\",
+        \"sections\":[
+        {
+        \"activityTitle\":\"Updated Resources\",
+        \"text\":\"$UPDATED\"
+        },
+        {
+        \"activityTitle\":\"Pull Request\",
+        \"text\":\"${{ steps.pr.outputs.pull-request-url }}\"
+        }
+        ]
+        }" \
+        ${{ secrets.TEAMS_WEBHOOK_URL }}
